@@ -1,0 +1,21 @@
+[project]
+name = "d-n-music-genai"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=3.1.0",
+    "soundfile>=0.14.0",
+    "torch==2.15.0+cu132",
+    "torchaudio==2.11.1+cu132",
+    "torchcodec>=0.17.0",
+    "transformers>=5.22.1",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+torchaudio = { index = "pytorch-cu132" }
