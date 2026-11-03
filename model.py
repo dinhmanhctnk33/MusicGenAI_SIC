@@ -38,7 +38,7 @@ class MusicGenTransformer(nn.Module):
 
     def __init__(
             self,
-            codebook_size: int = 2048,
+            codebook_size: int = 1024,
             num_codebooks: int = 4,
             text_dim: int = 768,  # Chiều ẩn từ T5-base
             d_model: int = 256,  # Cấu hình phù hợp GPU 4 GB
@@ -64,7 +64,7 @@ class MusicGenTransformer(nn.Module):
         ])
 
         # 2. Chiếu đặc trưng Text Embedding từ T5 (768 -> d_model)
-        self.text_projection = nn.Linear(text_dim, d_model)
+        self.text_projection = nn.Linear(text_dim, d_model, bias=False)
 
         # 3. Positional Encoding
         self.pos_encoder = PositionalEncoding(d_model, max_len=max_seq_len)
@@ -116,22 +116,44 @@ class MusicGenTransformer(nn.Module):
             raise ValueError(
                 f"Model cần {self.num_codebooks} codebook, nhưng đầu vào có {K}."
             )
-        if seq_len > self.max_seq_len:
+        delayed_len = seq_len + self.num_codebooks - 1
+        if delayed_len > self.max_seq_len:
             raise ValueError(
-                f"Sequence dài {seq_len}, vượt max_seq_len={self.max_seq_len}."
+                f"Sequence sau delay pattern dài {delayed_len}, "
+                f"vượt max_seq_len={self.max_seq_len}."
             )
+        if target_tokens.numel() > 0:
+            token_min = int(target_tokens.min())
+            token_max = int(target_tokens.max())
+            if token_min < 0 or token_max >= self.codebook_size:
+                raise ValueError(
+                    f"Token phải nằm trong [0, {self.codebook_size - 1}], "
+                    f"nhưng nhận min={token_min}, max={token_max}."
+                )
 
-        # Teacher forcing: dịch chuỗi sang phải để model không nhìn thấy token cần dự đoán.
+        # Delay pattern cho phép codebook sau thấy codebook trước của cùng frame.
+        delayed_tokens = torch.full(
+            (bs, K, delayed_len), self.codebook_size,
+            dtype=torch.long, device=device
+        )
+        for k in range(K):
+            delayed_tokens[:, k, k:k + seq_len] = target_tokens[:, k, :]
+
+        # Teacher forcing: dịch toàn bộ delay pattern sang phải một bước.
         bos = torch.full(
             (bs, K, 1), self.codebook_size, dtype=torch.long, device=device
         )
-        decoder_tokens = torch.cat([bos, target_tokens[:, :, :-1]], dim=-1)
+        decoder_tokens = torch.cat([bos, delayed_tokens[:, :, :-1]], dim=-1)
 
-        return self._decode(
+        delayed_logits = self._decode(
             decoder_tokens,
             text_embeddings,
             text_attention_mask=text_attention_mask,
             target_mask=target_mask,
+        )
+        return torch.stack(
+            [delayed_logits[:, k, k:k + seq_len, :] for k in range(K)],
+            dim=1,
         )
 
     def _decode(
@@ -142,8 +164,20 @@ class MusicGenTransformer(nn.Module):
             target_mask: torch.Tensor = None
     ) -> torch.Tensor:
         """Decode chuỗi đã có BOS; dùng chung cho training và generation."""
+        if decoder_tokens.ndim != 3:
+            raise ValueError("decoder_tokens phải có shape [batch, codebooks, sequence].")
+        if text_embeddings.ndim != 3:
+            raise ValueError("text_embeddings phải có shape [batch, sequence, text_dim].")
         bs, K, seq_len = decoder_tokens.shape
         device = decoder_tokens.device
+        if K != self.num_codebooks:
+            raise ValueError(f"Cần {self.num_codebooks} codebook, nhưng nhận {K}.")
+        if bs != text_embeddings.size(0):
+            raise ValueError("Batch size của audio và text không khớp.")
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"Sequence dài {seq_len}, vượt max_seq_len={self.max_seq_len}."
+            )
 
         # Sum Embedding từ tất cả K codebooks
         audio_emb = torch.zeros(
@@ -152,6 +186,7 @@ class MusicGenTransformer(nn.Module):
         )
         for k in range(K):
             audio_emb += self.codebook_embeddings[k](decoder_tokens[:, k, :])
+        audio_emb = audio_emb / math.sqrt(K)
 
         # Thêm Positional Encoding
         audio_emb = self.pos_encoder(audio_emb)
@@ -196,52 +231,65 @@ class MusicGenTransformer(nn.Module):
         """
         Inference / Sampling tự hồi quy để sinh ra chuỗi Acoustic Tokens từ Text Embedding.
         """
-        self.eval()
         if temperature <= 0:
             raise ValueError("temperature phải lớn hơn 0.")
-        if max_steps < 1 or max_steps > self.max_seq_len - 1:
+        max_audio_steps = self.max_seq_len - self.num_codebooks + 1
+        if max_steps < 1 or max_steps > max_audio_steps:
             raise ValueError(
-                f"max_steps phải nằm trong [1, {self.max_seq_len - 1}]."
+                f"max_steps phải nằm trong [1, {max_audio_steps}]."
             )
         device = text_embeddings.device
         bs = text_embeddings.size(0)
 
         # Khởi tạo token <BOS> (id = codebook_size)
-        generated_tokens = torch.full(
+        delayed_tokens = torch.full(
             (bs, self.num_codebooks, 1),
             fill_value=self.codebook_size,
             dtype=torch.long,
             device=device
         )
 
-        for _ in range(max_steps):
-            # Lấy logits cho bước hiện tại
-            logits = self._decode(
-                generated_tokens,
-                text_embeddings,
-                text_attention_mask=text_attention_mask
+        was_training = self.training
+        self.eval()
+        try:
+            pattern_steps = max_steps + self.num_codebooks - 1
+            for pattern_idx in range(pattern_steps):
+                logits = self._decode(
+                    delayed_tokens, text_embeddings,
+                    text_attention_mask=text_attention_mask
+                )
+                next_logits = logits[:, :, -1, :] / temperature
+                next_frame = torch.full(
+                    (bs, self.num_codebooks), self.codebook_size,
+                    dtype=torch.long, device=device
+                )
+                for k in range(self.num_codebooks):
+                    token_idx = pattern_idx - k
+                    if token_idx < 0 or token_idx >= max_steps:
+                        continue
+                    k_logits = next_logits[:, k, :]
+                    if top_k > 0:
+                        threshold = torch.topk(
+                            k_logits, min(top_k, k_logits.size(-1))
+                        ).values[:, -1:]
+                        k_logits = k_logits.masked_fill(
+                            k_logits < threshold, -float("inf")
+                        )
+                    probs = F.softmax(k_logits, dim=-1)
+                    next_frame[:, k] = torch.multinomial(
+                        probs, num_samples=1
+                    ).squeeze(1)
+                delayed_tokens = torch.cat(
+                    [delayed_tokens, next_frame.unsqueeze(-1)], dim=-1
+                )
+
+            pattern = delayed_tokens[:, :, 1:]
+            return torch.stack(
+                [pattern[:, k, k:k + max_steps] for k in range(self.num_codebooks)],
+                dim=1,
             )
-            next_logits = logits[:, :, -1, :] / temperature  # [bs, K, codebook_size]
-
-            next_tokens = []
-            for k in range(self.num_codebooks):
-                k_logits = next_logits[:, k, :]
-
-                # Top-k Sampling
-                if top_k > 0:
-                    v, _ = torch.topk(k_logits, min(top_k, k_logits.size(-1)))
-                    k_logits[k_logits < v[:, [-1]]] = -float('Inf')
-
-                probs = F.softmax(k_logits, dim=-1)
-                sampled_token = torch.multinomial(probs, num_samples=1)  # [bs, 1]
-                next_tokens.append(sampled_token)
-
-            # Ghép token vừa sample vào chuỗi đã sinh [bs, K, 1]
-            next_tokens_tensor = torch.cat(next_tokens, dim=1).unsqueeze(-1)
-            generated_tokens = torch.cat([generated_tokens, next_tokens_tensor], dim=-1)
-
-        # Trả về chuỗi token đã sinh (loại bỏ token <BOS> ở đầu)
-        return generated_tokens[:, :, 1:]
+        finally:
+            self.train(was_training)
 
 
 # --- Kiểm thử chạy mô hình ---
@@ -258,12 +306,12 @@ if __name__ == "__main__":
     print(f"Đang sử dụng thiết bị: {device}")
 
     # Tạo giả lập dữ liệu đầu vào từ data.py
-    dummy_audio_tokens = torch.randint(0, 2048, (batch_size, num_codebooks, audio_seq_len)).to(device)
+    dummy_audio_tokens = torch.randint(0, 1024, (batch_size, num_codebooks, audio_seq_len)).to(device)
     dummy_text_embeddings = torch.randn(batch_size, text_seq_len, 768).to(device)
 
     # Khởi tạo mô hình MusicGen Transformer
     model = MusicGenTransformer(
-        codebook_size=2048,
+        codebook_size=1024,
         num_codebooks=num_codebooks,
         text_dim=768,
         d_model=256,
@@ -275,7 +323,7 @@ if __name__ == "__main__":
     # 1. Test Forward Pass (Dùng trong Training)
     logits = model(dummy_audio_tokens, dummy_text_embeddings)
     print(f"-> Forward Logits Output Shape: {list(logits.shape)}")
-    print("   (Kỳ vọng: [Batch, Codebooks, SeqLen, CodebookSize] -> [1, 4, 250, 2048])")
+    print("   (Kỳ vọng: [Batch, Codebooks, SeqLen, CodebookSize] -> [1, 4, 250, 1024])")
 
     # 2. Test Generation / Sampling Pass (Dùng trong Inference)
     print("\nĐang chạy thử nghiệm hàm generate (sinh 10 bước token)...")

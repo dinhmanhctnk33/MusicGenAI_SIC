@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import zipfile
 import urllib.request
@@ -9,6 +10,10 @@ from torch.utils.data import Dataset, DataLoader
 import torchaudio
 from transformers import T5Tokenizer, T5EncoderModel
 from transformers import EncodecModel, AutoProcessor
+
+
+MIN_AUDIO_RMS = 1e-4
+MAX_PROMPT_FIELD_LENGTH = 200
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -99,19 +104,16 @@ class FMAAudioTextDataset(Dataset):
         allowed_subsets = subset_order[:max_subset_index + 1]
         tracks = tracks[tracks[("set", "subset")].isin(allowed_subsets)]
 
-        # Lọc các bài hát có nhãn thể loại (genre) và file audio tồn tại.
+        # Làm sạch metadata trước khi chia train/test. Việc loại file lỗi
+        # ngay tại đây tránh __getitem__ tự ý trả về một track khác, vốn có
+        # thể làm lẫn dữ liệu giữa train và test.
         self.meta = pd.DataFrame({
             "track_id": tracks.index,
             "title": tracks[('track', 'title')],
             "genre": tracks[('track', 'genre_top')],
             "artist": tracks[('artist', 'name')],
-        }).dropna(subset=["genre"])
-
-        self.meta = self.meta[
-            self.meta["track_id"].map(
-                lambda track_id: os.path.isfile(self._get_audio_path(int(track_id)))
-            )
-        ].reset_index(drop=True)
+        })
+        self.meta = self._clean_metadata(self.meta)
 
         self.track_ids = self.meta["track_id"].tolist()
         if not self.track_ids:
@@ -139,13 +141,62 @@ class FMAAudioTextDataset(Dataset):
         folder = tid_str[:3]
         return os.path.join(self.fma_audio_dir, folder, f"{tid_str}.mp3")
 
+    @staticmethod
+    def _clean_text(value, fallback: str) -> str:
+        """Chuẩn hóa text dùng trong prompt và loại ký tự điều khiển."""
+        if pd.isna(value):
+            return fallback
+        value = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value))
+        value = re.sub(r"\s+", " ", value).strip()
+        return value[:MAX_PROMPT_FIELD_LENGTH] or fallback
+
+    def _audio_file_is_readable(self, track_id: int) -> bool:
+        audio_path = self._get_audio_path(track_id)
+        if not os.path.isfile(audio_path):
+            return False
+        try:
+            info = sf.info(audio_path)
+            return info.frames > 0 and info.samplerate > 0 and info.channels > 0
+        except (RuntimeError, TypeError, ValueError):
+            return False
+
+    def _clean_metadata(self, meta: pd.DataFrame) -> pd.DataFrame:
+        initial_count = len(meta)
+        meta = meta.copy()
+        meta["track_id"] = pd.to_numeric(meta["track_id"], errors="coerce")
+        meta = meta.dropna(subset=["track_id", "genre"])
+        meta["track_id"] = meta["track_id"].astype("int64")
+        meta = meta[meta["track_id"] >= 0]
+        meta = meta.drop_duplicates(subset=["track_id"], keep="first")
+
+        meta["genre"] = meta["genre"].map(lambda x: self._clean_text(x, ""))
+        meta["title"] = meta["title"].map(
+            lambda x: self._clean_text(x, "Unknown Title")
+        )
+        meta["artist"] = meta["artist"].map(
+            lambda x: self._clean_text(x, "Unknown Artist")
+        )
+        meta = meta[meta["genre"] != ""]
+
+        readable_mask = meta["track_id"].map(self._audio_file_is_readable)
+        unreadable_count = int((~readable_mask).sum())
+        meta = meta[readable_mask].reset_index(drop=True)
+        print(
+            "Làm sạch dataset: "
+            f"giữ {len(meta)}/{initial_count} track; "
+            f"loại {unreadable_count} file thiếu/hỏng."
+        )
+        return meta
+
     def _generate_text_prompt(self, row: pd.Series) -> str:
-        title = row["title"] if pd.notna(row["title"]) else "Unknown Title"
-        artist = row["artist"] if pd.notna(row["artist"]) else "Unknown Artist"
+        title = row["title"]
+        artist = row["artist"]
         genre = row["genre"]
         return f"A {genre} music track titled '{title}' by {artist}."
 
-    def _load_and_process_audio(self, audio_path: str) -> torch.Tensor:
+    def _load_and_process_audio(
+            self, audio_path: str, random_crop: bool = True
+    ) -> torch.Tensor:
         # soundfile đọc MP3 trực tiếp qua libsndfile, tránh phụ thuộc TorchCodec/FFmpeg
         # của torchaudio.load trên các phiên bản torchaudio mới.
         audio, sr = sf.read(audio_path, dtype="float32", always_2d=True)
@@ -154,6 +205,20 @@ class FMAAudioTextDataset(Dataset):
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
 
+        if waveform.numel() == 0 or not torch.isfinite(waveform).all():
+            raise ValueError("Audio rỗng hoặc chứa NaN/Inf.")
+
+        # Loại DC offset và các file gần như im lặng. Chỉ scale khi
+        # biên độ vượt [-1, 1], không làm thay đổi loudness bình thường.
+        waveform = waveform - waveform.mean(dim=1, keepdim=True)
+        rms = waveform.square().mean().sqrt().item()
+        if rms < MIN_AUDIO_RMS:
+            raise ValueError(f"Audio quá im lặng (RMS={rms:.2e}).")
+        peak = waveform.abs().max()
+        if peak > 1.0:
+            waveform = waveform / peak
+        waveform = waveform.clamp(-1.0, 1.0)
+
         if sr != self.sample_rate:
             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
             waveform = resampler(waveform)
@@ -161,7 +226,10 @@ class FMAAudioTextDataset(Dataset):
         num_samples = waveform.shape[1]
         if num_samples > self.target_samples:
             max_start = num_samples - self.target_samples
-            start = torch.randint(0, max_start + 1, (1,)).item()
+            if random_crop:
+                start = torch.randint(0, max_start + 1, (1,)).item()
+            else:
+                start = max_start // 2
             waveform = waveform[:, start:start + self.target_samples]
         elif num_samples < self.target_samples:
             pad_len = self.target_samples - num_samples
@@ -173,69 +241,64 @@ class FMAAudioTextDataset(Dataset):
         return len(self.track_ids)
 
     def __getitem__(self, idx: int):
+        return self.get_item(idx, random_crop=True)
+
+    def get_item(self, idx: int, random_crop: bool = True):
+        """Lấy sample với crop ngẫu nhiên cho train hoặc crop giữa cho eval."""
         if not self.track_ids:
             raise RuntimeError("Dataset không có bài hát hợp lệ để xử lý.")
 
-        last_error = None
-        for offset in range(len(self)):
-            current_idx = (idx + offset) % len(self)
-            track_id = self.track_ids[current_idx]
-            audio_path = self._get_audio_path(track_id)
-            row = self.meta.iloc[current_idx]
+        track_id = self.track_ids[idx]
+        audio_path = self._get_audio_path(track_id)
+        row = self.meta.iloc[idx]
 
-            if not os.path.exists(audio_path):
-                last_error = FileNotFoundError(f"Không tìm thấy audio: {audio_path}")
-                continue
-
-            try:
+        try:
             # 1. Mã hóa Audio -> Acoustic Tokens
-                waveform = self._load_and_process_audio(audio_path)
-                inputs = self.encodec_processor(
-                    raw_audio=waveform.squeeze(0).numpy(),
-                    sampling_rate=self.sample_rate,
-                    return_tensors="pt"
-                )
+            waveform = self._load_and_process_audio(
+                audio_path, random_crop=random_crop
+            )
+            inputs = self.encodec_processor(
+                raw_audio=waveform.squeeze(0).numpy(),
+                sampling_rate=self.sample_rate,
+                return_tensors="pt"
+            )
 
-                with torch.no_grad():
-                    audio_inputs = inputs["input_values"].to(self.device)
-                    padding_mask = inputs.get("padding_mask")
-                    if padding_mask is not None:
-                        padding_mask = padding_mask.to(self.device)
-                    encodec_out = self.encodec_model.encode(audio_inputs, padding_mask)
-                    audio_tokens = encodec_out.audio_codes[0].squeeze(0).squeeze(0).cpu()
+            with torch.no_grad():
+                audio_inputs = inputs["input_values"].to(self.device)
+                padding_mask = inputs.get("padding_mask")
+                if padding_mask is not None:
+                    padding_mask = padding_mask.to(self.device)
+                encodec_out = self.encodec_model.encode(audio_inputs, padding_mask)
+                audio_tokens = encodec_out.audio_codes[0].squeeze(0).squeeze(0).cpu()
 
             # 2. Mã hóa Text Prompt -> Text Embeddings
-                text_prompt = self._generate_text_prompt(row)
-                text_inputs = self.t5_tokenizer(
-                    text_prompt,
-                    padding="max_length",
-                    max_length=64,
-                    truncation=True,
-                    return_tensors="pt"
-                )
+            text_prompt = self._generate_text_prompt(row)
+            text_inputs = self.t5_tokenizer(
+                text_prompt,
+                padding="max_length",
+                max_length=64,
+                truncation=True,
+                return_tensors="pt"
+            )
 
-                with torch.no_grad():
-                    input_ids = text_inputs.input_ids.to(self.device)
-                    attention_mask = text_inputs.attention_mask.to(self.device)
-                    t5_outputs = self.t5_encoder(input_ids=input_ids, attention_mask=attention_mask)
-                    text_embeddings = t5_outputs.last_hidden_state.squeeze(0).cpu()
+            with torch.no_grad():
+                input_ids = text_inputs.input_ids.to(self.device)
+                attention_mask = text_inputs.attention_mask.to(self.device)
+                t5_outputs = self.t5_encoder(input_ids=input_ids, attention_mask=attention_mask)
+                text_embeddings = t5_outputs.last_hidden_state.squeeze(0).cpu()
 
-                return {
-                    "audio_tokens": audio_tokens,
-                    "text_embeddings": text_embeddings,
-                    "text_attention_mask": text_inputs.attention_mask.squeeze(0).cpu(),
-                    "prompt": text_prompt,
-                    "track_id": track_id
-                }
+            return {
+                "audio_tokens": audio_tokens,
+                "text_embeddings": text_embeddings,
+                "text_attention_mask": text_inputs.attention_mask.squeeze(0).cpu(),
+                "prompt": text_prompt,
+                "track_id": track_id
+            }
 
-            except Exception as exc:
-                last_error = RuntimeError(
-                    f"Không thể xử lý track {track_id} tại '{audio_path}': {exc}"
-                )
-
-        raise RuntimeError(
-            f"Không thể đọc bất kỳ bài hát nào sau {len(self)} lần thử."
-        ) from last_error
+        except Exception as exc:
+            raise RuntimeError(
+                f"Không thể xử lý track {track_id} tại '{audio_path}': {exc}"
+            ) from exc
 
 
 def create_dataloader(

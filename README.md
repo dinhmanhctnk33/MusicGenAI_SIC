@@ -71,7 +71,7 @@ Sau khi lọc, pipeline sử dụng 8.000 bài thuộc FMA Small. Mỗi mẫu g�
 - `text_attention_mask`: `[64]`
 - prompt và track ID
 
-Audio được chuẩn hóa mono, 32 kHz và cắt/đệm về 5 giây. EnCodec sử dụng 4 codebook, mỗi codebook có 2.048 token.
+Audio được chuẩn hóa mono, 32 kHz và cắt/đệm về 5 giây. EnCodec sử dụng 4 codebook, mỗi codebook có 1.024 token.
 
 ## Kiểm tra mô hình
 
@@ -88,7 +88,7 @@ Cấu hình mặc định phù hợp GPU 4 GB:
 | Attention heads | 8 |
 | Feed-forward dimension | 1024 |
 | Maximum sequence length | 512 |
-| Codebook size | 2048 |
+| Codebook size | 1024 |
 | Số codebook | 4 |
 
 ## Huấn luyện
@@ -99,23 +99,24 @@ Cấu hình mặc định phù hợp GPU 4 GB:
 
 Cấu hình huấn luyện hiện tại:
 
-- 4 epoch
+- Tối đa 20 epoch, early stopping sau 4 epoch không cải thiện
 - Batch size 1
 - Gradient accumulation 8 bước
 - Automatic Mixed Precision FP16 trên CUDA
 - Gradient clipping với `max_norm=1.0`
 - AdamW và Cosine Annealing learning-rate scheduler
 - Classifier-free guidance dropout 10%
-- Chia 8.000 bài theo tỷ lệ **60% train / 40% test**:
-  - 4.800 bài train
-  - 3.200 bài test
+- Chia dữ liệu theo tỷ lệ **90% train / 5% validation / 5% test**
+- T5 và EnCodec chạy trên CPU để không chiếm VRAM của model train
+- Train dùng random crop; validation và test dùng crop cố định ở giữa bài
 
-Test set chỉ được đánh giá một lần sau khi hoàn tất huấn luyện, không dùng để cập nhật trọng số.
+Validation set được đánh giá sau mỗi epoch để lưu best checkpoint và early stopping. Test set chỉ được đánh giá một lần sau khi train.
 
 Checkpoint mới nhất được lưu tại:
 
 ```text
 checkpoints/latest_musicgen_model.pt
+checkpoints/best_musicgen_model.pt
 ```
 
 Checkpoint chứa trạng thái model, optimizer, scheduler, AMP scaler, epoch, training loss và cấu hình.
@@ -145,4 +146,3 @@ set MUSICGEN_RESUME=
 ## Giấy phép dữ liệu
 
 FMA có giấy phép riêng cho metadata và từng track âm thanh. Người sử dụng dự án cần tuân thủ giấy phép của [Free Music Archive](https://github.com/mdeff/fma) và giấy phép tương ứng của từng bản nhạc.
-

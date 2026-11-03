@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 
 from data import create_dataloader
 from model import MusicGenTransformer
@@ -20,14 +20,17 @@ if hasattr(sys.stdout, "reconfigure"):
 # Cấu hình nhỏ, phù hợp RTX 2050 4 GB.
 TRAIN_CONFIG = {
     "batch_size": 1,
-    "epochs": 4,
+    "epochs": 20,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
     "audio_duration": 5.0,
     "gradient_accumulation_steps": 8,
-    "test_ratio": 0.4,
+    "validation_ratio": 0.05,
+    "test_ratio": 0.05,
+    "early_stopping_patience": 4,
+    "encoder_device": "cpu",
     "cfg_drop_prob": 0.1,
-    "codebook_size": 2048,
+    "codebook_size": 1024,
     "num_codebooks": 4,
     "text_dim": 768,
     "d_model": 256,
@@ -75,8 +78,15 @@ def _compute_loss(model, batch, criterion, device, use_amp, cfg_drop_prob=0.0):
             logits.reshape(-1, logits.size(-1)),
             audio_tokens.reshape(-1),
         )
+        codebook_losses = torch.stack([
+            criterion(
+                logits[:, k].reshape(-1, logits.size(-1)),
+                audio_tokens[:, k].reshape(-1),
+            ).detach()
+            for k in range(logits.size(1))
+        ])
 
-    return loss
+    return loss, codebook_losses
 
 
 def train_epoch(
@@ -91,11 +101,12 @@ def train_epoch(
 ):
     model.train()
     total_loss = 0.0
+    total_codebook_losses = torch.zeros(model.num_codebooks, dtype=torch.float64)
     optimizer.zero_grad(set_to_none=True)
     use_amp = device.type == "cuda"
 
     for batch_idx, batch in enumerate(dataloader):
-        loss = _compute_loss(
+        loss, codebook_losses = _compute_loss(
             model,
             batch,
             criterion,
@@ -103,7 +114,9 @@ def train_epoch(
             use_amp,
             cfg_drop_prob=cfg_drop_prob,
         )
-        scaler.scale(loss / accumulation_steps).backward()
+        group_start = (batch_idx // accumulation_steps) * accumulation_steps
+        actual_group_size = min(accumulation_steps, len(dataloader) - group_start)
+        scaler.scale(loss / actual_group_size).backward()
 
         is_update_step = (batch_idx + 1) % accumulation_steps == 0
         is_last_batch = (batch_idx + 1) == len(dataloader)
@@ -115,23 +128,26 @@ def train_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         total_loss += loss.detach().item()
+        total_codebook_losses += codebook_losses.double().cpu()
         if (batch_idx + 1) % 10 == 0 or is_last_batch:
             print(
                 f"   Batch [{batch_idx + 1}/{len(dataloader)}] "
                 f"- Loss: {loss.item():.4f}"
             )
 
-    return total_loss / max(len(dataloader), 1)
+    denominator = max(len(dataloader), 1)
+    return total_loss / denominator, total_codebook_losses / denominator
 
 
 @torch.no_grad()
 def validate(model, dataloader, criterion, device):
     model.eval()
     total_loss = 0.0
+    total_codebook_losses = torch.zeros(model.num_codebooks, dtype=torch.float64)
     use_amp = device.type == "cuda"
 
     for batch in dataloader:
-        loss = _compute_loss(
+        loss, codebook_losses = _compute_loss(
             model,
             batch,
             criterion,
@@ -140,26 +156,52 @@ def validate(model, dataloader, criterion, device):
             cfg_drop_prob=0.0,
         )
         total_loss += loss.item()
+        total_codebook_losses += codebook_losses.double().cpu()
 
-    return total_loss / max(len(dataloader), 1)
+    denominator = max(len(dataloader), 1)
+    return total_loss / denominator, total_codebook_losses / denominator
 
 
-def _create_train_test_loaders(config):
+class CropModeDataset(Dataset):
+    """Subset view chọn crop ngẫu nhiên cho train, crop cố định cho eval."""
+
+    def __init__(self, subset, random_crop):
+        self.subset = subset
+        self.random_crop = random_crop
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        source_idx = self.subset.indices[idx]
+        return self.subset.dataset.get_item(
+            source_idx, random_crop=self.random_crop
+        )
+
+
+def _create_data_loaders(config):
     full_loader = create_dataloader(
         batch_size=config["batch_size"],
         audio_duration=config["audio_duration"],
         shuffle=False,
         auto_download=True,
         num_workers=0,
+        device=config["encoder_device"],
     )
     dataset = full_loader.dataset
 
-    test_size = int(len(dataset) * config["test_ratio"])
-    train_size = len(dataset) - test_size
+    validation_size = max(1, int(len(dataset) * config["validation_ratio"]))
+    test_size = max(1, int(len(dataset) * config["test_ratio"]))
+    train_size = len(dataset) - validation_size - test_size
+    if train_size < 1:
+        raise ValueError("Dataset quá nhỏ để chia train/validation/test.")
     generator = torch.Generator().manual_seed(42)
-    train_dataset, test_dataset = random_split(
-        dataset, [train_size, test_size], generator=generator
+    train_subset, validation_subset, test_subset = random_split(
+        dataset, [train_size, validation_size, test_size], generator=generator
     )
+    train_dataset = CropModeDataset(train_subset, random_crop=True)
+    validation_dataset = CropModeDataset(validation_subset, random_crop=False)
+    test_dataset = CropModeDataset(test_subset, random_crop=False)
 
     common = {
         "batch_size": config["batch_size"],
@@ -167,23 +209,45 @@ def _create_train_test_loaders(config):
         "pin_memory": torch.cuda.is_available(),
     }
     train_loader = DataLoader(train_dataset, shuffle=True, **common)
+    validation_loader = DataLoader(validation_dataset, shuffle=False, **common)
     test_loader = DataLoader(test_dataset, shuffle=False, **common)
-    return train_loader, test_loader
+    return train_loader, validation_loader, test_loader
 
 
-def _load_checkpoint(path, model, optimizer, scheduler, scaler, device):
+def _load_checkpoint(path, model, optimizer, scheduler, scaler, device, config):
     if not path or not os.path.isfile(path):
-        return 1, float("inf")
+        return 1, float("inf"), float("inf")
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    saved_config = checkpoint.get("config", {})
+    architecture_keys = (
+        "codebook_size", "num_codebooks", "text_dim", "d_model",
+        "num_layers", "nhead", "dim_feedforward", "max_seq_len",
+    )
+    mismatches = [
+        f"{key}: checkpoint={saved_config.get(key)!r}, current={config[key]!r}"
+        for key in architecture_keys
+        if saved_config.get(key) != config[key]
+    ]
+    if mismatches:
+        raise ValueError(
+            "Checkpoint không tương thích với model hiện tại:\n- "
+            + "\n- ".join(mismatches)
+        )
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    if saved_config.get("epochs") == config["epochs"]:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    else:
+        for group in optimizer.param_groups:
+            group["lr"] = config["learning_rate"]
+        print("Số epoch đã thay đổi; khởi tạo lại LR scheduler.")
     scaler.load_state_dict(checkpoint["scaler_state_dict"])
     start_epoch = checkpoint["epoch"] + 1
     last_loss = checkpoint.get("training_loss", float("inf"))
     print(f"Đã tiếp tục từ checkpoint: {path} (epoch {checkpoint['epoch']})")
-    return start_epoch, last_loss
+    best_validation_loss = checkpoint.get("best_validation_loss", float("inf"))
+    return start_epoch, last_loss, best_validation_loss
 
 
 def train_model():
@@ -204,10 +268,16 @@ def train_model():
     )
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, "latest_musicgen_model.pt")
+    best_checkpoint_path = os.path.join(checkpoint_dir, "best_musicgen_model.pt")
 
-    print("\n[1/4] Đang nạp dữ liệu và chia train/test theo tỷ lệ 60/40...")
-    train_loader, test_loader = _create_train_test_loaders(config)
-    print(f"Train: {len(train_loader.dataset)} | Test: {len(test_loader.dataset)}")
+    print("\n[1/4] Đang nạp dữ liệu và chia train/validation/test...")
+    train_loader, validation_loader, test_loader = _create_data_loaders(config)
+    print(
+        f"Train: {len(train_loader.dataset)} | "
+        f"Validation: {len(validation_loader.dataset)} | "
+        f"Test: {len(test_loader.dataset)}"
+    )
+    print(f"Thiết bị encoder T5/EnCodec: {config['encoder_device']}")
 
     print("\n[2/4] Đang khởi tạo MusicGen Transformer...")
     model = MusicGenTransformer(
@@ -232,16 +302,17 @@ def train_model():
 
     # Đặt MUSICGEN_RESUME thành đường dẫn checkpoint nếu muốn tiếp tục training.
     resume_path = os.environ.get("MUSICGEN_RESUME")
-    start_epoch, last_loss = _load_checkpoint(
-        resume_path, model, optimizer, scheduler, scaler, device
+    start_epoch, last_loss, best_validation_loss = _load_checkpoint(
+        resume_path, model, optimizer, scheduler, scaler, device, config
     )
+    epochs_without_improvement = 0
 
     print(f"\n[3/4] Bắt đầu huấn luyện {config['epochs']} epoch...\n")
     for epoch in range(start_epoch, config["epochs"] + 1):
         start_time = time.time()
         print(f"--- Epoch [{epoch}/{config['epochs']}] ---")
 
-        train_loss = train_epoch(
+        train_loss, train_codebook_losses = train_epoch(
             model,
             train_loader,
             optimizer,
@@ -251,33 +322,84 @@ def train_model():
             accumulation_steps=config["gradient_accumulation_steps"],
             cfg_drop_prob=config["cfg_drop_prob"],
         )
+        validation_loss, validation_codebook_losses = validate(
+            model, validation_loader, criterion, device
+        )
         scheduler.step()
 
         elapsed = time.time() - start_time
         print(
             f"Epoch {epoch} hoàn tất trong {elapsed:.1f}s | "
-            f"Train Loss: {train_loss:.4f}"
+            f"Train Loss: {train_loss:.4f} | "
+            f"Validation Loss: {validation_loss:.4f} | "
+            f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+        )
+        print(
+            "   Train loss/codebook: "
+            + ", ".join(
+                f"CB{k}={value:.4f}"
+                for k, value in enumerate(train_codebook_losses.tolist())
+            )
+        )
+        print(
+            "   Validation loss/codebook: "
+            + ", ".join(
+                f"CB{k}={value:.4f}"
+                for k, value in enumerate(validation_codebook_losses.tolist())
+            )
         )
 
         last_loss = train_loss
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "training_loss": last_loss,
-                "config": config,
-            },
-            checkpoint_path,
-        )
+        improved = validation_loss < best_validation_loss
+        if improved:
+            best_validation_loss = validation_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "training_loss": last_loss,
+            "validation_loss": validation_loss,
+            "best_validation_loss": best_validation_loss,
+            "config": config,
+        }
+        torch.save(checkpoint, checkpoint_path)
         print(f"[CHECKPOINT] Đã lưu: {checkpoint_path}")
+        if improved:
+            torch.save(checkpoint, best_checkpoint_path)
+            print(f"[BEST] Validation loss mới: {best_checkpoint_path}")
         print()
 
+        if epochs_without_improvement >= config["early_stopping_patience"]:
+            print(
+                "Early stopping: validation loss không cải thiện trong "
+                f"{config['early_stopping_patience']} epoch."
+            )
+            break
+
     print("\n[4/4] Đang đánh giá một lần trên test set...")
-    test_loss = validate(model, test_loader, criterion, device)
+    if os.path.isfile(best_checkpoint_path):
+        best_checkpoint = torch.load(
+            best_checkpoint_path, map_location=device, weights_only=False
+        )
+        model.load_state_dict(best_checkpoint["model_state_dict"])
+        print(f"Đã nạp best checkpoint từ epoch {best_checkpoint['epoch']}.")
+    test_loss, test_codebook_losses = validate(
+        model, test_loader, criterion, device
+    )
     print(f"Test Loss: {test_loss:.4f}")
+    print(
+        "Test loss/codebook: "
+        + ", ".join(
+            f"CB{k}={value:.4f}"
+            for k, value in enumerate(test_codebook_losses.tolist())
+        )
+    )
 
     print("=" * 60)
     print("  QUÁ TRÌNH HUẤN LUYỆN HOÀN TẤT!")
