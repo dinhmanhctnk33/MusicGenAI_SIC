@@ -11,6 +11,7 @@ MusicGenAI SIC là dự án thử nghiệm sinh token âm nhạc có điều ki�
 
 ```text
 Music-GenAI/
+├── config.py        # Hyperparameter tập trung cho data/model/train/generation
 ├── data.py          # Tải, chuẩn hóa và mã hóa dữ liệu FMA
 ├── model.py         # Mô hình MusicGen Transformer
 ├── train.py         # Huấn luyện, kiểm thử và lưu checkpoint
@@ -71,7 +72,7 @@ Sau khi lọc, pipeline sử dụng 8.000 bài thuộc FMA Small. Mỗi mẫu g�
 - `text_attention_mask`: `[64]`
 - prompt và track ID
 
-Audio được chuẩn hóa mono, 32 kHz và cắt/đệm về 5 giây. EnCodec sử dụng 4 codebook, mỗi codebook có 1.024 token.
+Audio được chuẩn hóa mono, 32 kHz và cắt/đệm về 5 giây. EnCodec sử dụng 4 codebook, mỗi codebook có 2.048 token.
 
 ## Kiểm tra mô hình
 
@@ -88,10 +89,12 @@ Cấu hình mặc định phù hợp GPU 4 GB:
 | Attention heads | 8 |
 | Feed-forward dimension | 1024 |
 | Maximum sequence length | 512 |
-| Codebook size | 1024 |
+| Codebook size | 2048 |
 | Số codebook | 4 |
 
 ## Huấn luyện
+
+Mọi hyperparameter được khai báo tập trung trong `config.py`. Nên chỉnh file này thay vì sửa trực tiếp `data.py`, `model.py`, `train.py` hay `test.py`.
 
 ```cmd
 .\.venv\Scripts\python.exe train.py
@@ -107,8 +110,9 @@ Cấu hình huấn luyện hiện tại:
 - AdamW và Cosine Annealing learning-rate scheduler
 - Classifier-free guidance dropout 10%
 - Chia dữ liệu theo tỷ lệ **90% train / 5% validation / 5% test**
-- T5 và EnCodec chạy trên CPU để không chiếm VRAM của model train
-- Train dùng random crop; validation và test dùng crop cố định ở giữa bài
+- T5 và EnCodec mã hóa mỗi track một lần, sau đó lưu tensor cache trong `dataset/encoded_cache_v1`
+- Cache dùng crop cố định ở giữa bài để các epoch sau không phải chạy lại T5/EnCodec
+- GPU từ 8 GB trở lên tự dùng CUDA khi tạo cache; GPU 4 GB dùng CPU để tránh tràn VRAM
 
 Validation set được đánh giá sau mỗi epoch để lưu best checkpoint và early stopping. Test set chỉ được đánh giá một lần sau khi train.
 
@@ -120,6 +124,8 @@ checkpoints/best_musicgen_model.pt
 ```
 
 Checkpoint chứa trạng thái model, optimizer, scheduler, AMP scaler, epoch, training loss và cấu hình.
+
+Lần chạy đầu sẽ tạo cache và có thể mất nhiều thời gian. Các lần chạy và epoch sau sẽ đọc cache trực tiếp. Có thể ép thiết bị encoder bằng biến môi trường `MUSICGEN_ENCODER_DEVICE=cpu` hoặc `MUSICGEN_ENCODER_DEVICE=cuda`.
 
 ## Tiếp tục huấn luyện
 

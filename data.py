@@ -11,9 +11,11 @@ import torchaudio
 from transformers import T5Tokenizer, T5EncoderModel
 from transformers import EncodecModel, AutoProcessor
 
+from config import DATA_CONFIG, TRAIN_CONFIG
 
-MIN_AUDIO_RMS = 1e-4
-MAX_PROMPT_FIELD_LENGTH = 200
+
+MIN_AUDIO_RMS = DATA_CONFIG["min_audio_rms"]
+MAX_PROMPT_FIELD_LENGTH = DATA_CONFIG["max_prompt_field_length"]
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -21,7 +23,9 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-def download_and_extract_fma(dataset_dir: str, subset: str = "small"):
+def download_and_extract_fma(
+        dataset_dir: str, subset: str = DATA_CONFIG["subset"]
+):
     """
     Tự động kiểm tra, tải và giải nén FMA dataset (metadata + audio) nếu chưa tồn tại.
     """
@@ -72,18 +76,34 @@ class FMAAudioTextDataset(Dataset):
             self,
             fma_metadata_dir: str,
             fma_audio_dir: str,
-            sample_rate: int = 32000,
-            audio_duration: float = 5.0,
-            subset: str = "small",
-            t5_model_name: str = "t5-base",
-            encodec_model_name: str = "facebook/encodec_32khz",
-            device: str = "cuda" if torch.cuda.is_available() else "cpu"
+            sample_rate: int = DATA_CONFIG["sample_rate"],
+            audio_duration: float = DATA_CONFIG["audio_duration"],
+            subset: str = DATA_CONFIG["subset"],
+            t5_model_name: str = DATA_CONFIG["t5_model_name"],
+            encodec_model_name: str = DATA_CONFIG["encodec_model_name"],
+            device: str = "cuda" if torch.cuda.is_available() else "cpu",
+            cache_dir: str = None,
+            use_cache: bool = True,
     ):
         super().__init__()
         self.fma_audio_dir = fma_audio_dir
         self.sample_rate = sample_rate
         self.target_samples = int(sample_rate * audio_duration)
         self.device = device
+        self.t5_model_name = t5_model_name
+        self.encodec_model_name = encodec_model_name
+        self.use_cache = use_cache
+        if cache_dir is None:
+            dataset_root = os.path.dirname(fma_audio_dir)
+            duration_ms = round(audio_duration * 1000)
+            cache_dir = os.path.join(
+                dataset_root,
+                f"encoded_cache_{DATA_CONFIG['cache_version']}",
+                f"sr{sample_rate}_duration{duration_ms}ms",
+            )
+        self.cache_dir = cache_dir
+        if self.use_cache:
+            os.makedirs(self.cache_dir, exist_ok=True)
 
         # 1. Đọc Metadata FMA (tracks.csv)
         tracks_path = os.path.join(fma_metadata_dir, "tracks.csv")
@@ -122,19 +142,97 @@ class FMAAudioTextDataset(Dataset):
             )
         print(f"Đã nạp thành công {len(self.track_ids)} bài hát hợp lệ.")
 
-        # 2. Khởi tạo Tokenizers và Pre-trained Encoders
-        print("Đang tải/khởi tạo T5 Encoder và EnCodec Processor...")
-        self.t5_tokenizer = T5Tokenizer.from_pretrained(t5_model_name)
-        self.t5_encoder = T5EncoderModel.from_pretrained(t5_model_name).to(self.device).eval()
+        # Lazy-load encoder: nếu cache đã đầy thì lần chạy sau không
+        # cần nạp T5/EnCodec vào RAM/VRAM.
+        self.t5_tokenizer = None
+        self.t5_encoder = None
+        self.encodec_processor = None
+        self.encodec_model = None
+        if self.use_cache:
+            print(f"Cache encoded tensors: {self.cache_dir}")
 
-        self.encodec_processor = AutoProcessor.from_pretrained(encodec_model_name)
-        self.encodec_model = EncodecModel.from_pretrained(encodec_model_name).to(self.device).eval()
-
-        # Đóng đóng băng trọng số Encoder
+    def _ensure_encoders_loaded(self):
+        if self.t5_encoder is not None and self.encodec_model is not None:
+            return
+        print(f"Đang nạp T5 và EnCodec trên {self.device} cho cache miss...")
+        self.t5_tokenizer = T5Tokenizer.from_pretrained(self.t5_model_name)
+        self.t5_encoder = T5EncoderModel.from_pretrained(
+            self.t5_model_name
+        ).to(self.device).eval()
+        self.encodec_processor = AutoProcessor.from_pretrained(
+            self.encodec_model_name
+        )
+        self.encodec_model = EncodecModel.from_pretrained(
+            self.encodec_model_name
+        ).to(self.device).eval()
         for param in self.t5_encoder.parameters():
             param.requires_grad = False
         for param in self.encodec_model.parameters():
             param.requires_grad = False
+
+    def _cache_path(self, track_id: int) -> str:
+        return os.path.join(self.cache_dir, f"{track_id:06d}.pt")
+
+    def _load_cached_item(self, track_id: int):
+        if not self.use_cache:
+            return None
+        path = self._cache_path(track_id)
+        if not os.path.isfile(path):
+            return None
+        try:
+            cached = torch.load(path, map_location="cpu", weights_only=False)
+            return {
+                "audio_tokens": cached["audio_tokens"].long(),
+                "text_embeddings": cached["text_embeddings"].float(),
+                "text_attention_mask": cached["text_attention_mask"].long(),
+                "prompt": cached["prompt"],
+                "track_id": track_id,
+            }
+        except (OSError, RuntimeError, KeyError, TypeError):
+            return None
+
+    def _save_cached_item(self, item):
+        if not self.use_cache:
+            return
+        path = self._cache_path(item["track_id"])
+        temp_path = f"{path}.{os.getpid()}.tmp"
+        compact = {
+            "audio_tokens": item["audio_tokens"].to(torch.int16),
+            "text_embeddings": item["text_embeddings"].to(torch.float16),
+            "text_attention_mask": item["text_attention_mask"].to(torch.uint8),
+            "prompt": item["prompt"],
+        }
+        torch.save(compact, temp_path)
+        os.replace(temp_path, path)
+
+    def populate_cache(self):
+        """Mã hóa các track còn thiếu một lần trước khi train."""
+        if not self.use_cache:
+            return
+        missing_indices = [
+            idx for idx, track_id in enumerate(self.track_ids)
+            if not os.path.isfile(self._cache_path(track_id))
+        ]
+        if not missing_indices:
+            print(f"Cache đã đầy: {len(self.track_ids)} track.")
+            return
+        print(
+            f"Đang tạo cache cho {len(missing_indices)}/{len(self.track_ids)} track..."
+        )
+        for position, idx in enumerate(missing_indices, start=1):
+            # Crop giữa cố định giúp cache tái lập được.
+            self.get_item(idx, random_crop=False)
+            if position % 100 == 0 or position == len(missing_indices):
+                print(f"   Cache [{position}/{len(missing_indices)}]")
+
+    def release_encoders(self):
+        """Giải phóng encoder sau khi cache đầy để nhường RAM/VRAM."""
+        self.t5_tokenizer = None
+        self.t5_encoder = None
+        self.encodec_processor = None
+        self.encodec_model = None
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _get_audio_path(self, track_id: int) -> str:
         tid_str = f"{track_id:06d}"
@@ -252,7 +350,12 @@ class FMAAudioTextDataset(Dataset):
         audio_path = self._get_audio_path(track_id)
         row = self.meta.iloc[idx]
 
+        cached_item = self._load_cached_item(track_id)
+        if cached_item is not None:
+            return cached_item
+
         try:
+            self._ensure_encoders_loaded()
             # 1. Mã hóa Audio -> Acoustic Tokens
             waveform = self._load_and_process_audio(
                 audio_path, random_crop=random_crop
@@ -276,7 +379,7 @@ class FMAAudioTextDataset(Dataset):
             text_inputs = self.t5_tokenizer(
                 text_prompt,
                 padding="max_length",
-                max_length=64,
+                max_length=DATA_CONFIG["text_max_length"],
                 truncation=True,
                 return_tensors="pt"
             )
@@ -287,13 +390,15 @@ class FMAAudioTextDataset(Dataset):
                 t5_outputs = self.t5_encoder(input_ids=input_ids, attention_mask=attention_mask)
                 text_embeddings = t5_outputs.last_hidden_state.squeeze(0).cpu()
 
-            return {
+            item = {
                 "audio_tokens": audio_tokens,
                 "text_embeddings": text_embeddings,
                 "text_attention_mask": text_inputs.attention_mask.squeeze(0).cpu(),
                 "prompt": text_prompt,
                 "track_id": track_id
             }
+            self._save_cached_item(item)
+            return item
 
         except Exception as exc:
             raise RuntimeError(
@@ -303,7 +408,7 @@ class FMAAudioTextDataset(Dataset):
 
 def create_dataloader(
         dataset_dir: str = None,
-        batch_size: int = 8,
+        batch_size: int = TRAIN_CONFIG["batch_size"],
         shuffle: bool = True,
         auto_download: bool = True,
         num_workers: int = 0,
@@ -315,11 +420,12 @@ def create_dataloader(
         )
 
     if dataset_dir is None:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        dataset_dir = os.path.join(base_dir, "dataset")
+        dataset_dir = DATA_CONFIG["dataset_dir"]
 
     if auto_download:
-        download_and_extract_fma(dataset_dir=dataset_dir, subset="small")
+        download_and_extract_fma(
+            dataset_dir=dataset_dir, subset=DATA_CONFIG["subset"]
+        )
 
     fma_metadata_dir = os.path.join(dataset_dir, "fma_metadata")
     fma_audio_dir = os.path.join(dataset_dir, "fma_small")
@@ -340,7 +446,11 @@ def create_dataloader(
 
 if __name__ == "__main__":
     print("=== KIỂM TRA PIPELINE DỮ LIỆU DATA.PY ===")
-    dataloader = create_dataloader(batch_size=1, audio_duration=5.0, auto_download=True)
+    dataloader = create_dataloader(
+        batch_size=1,
+        audio_duration=DATA_CONFIG["audio_duration"],
+        auto_download=True,
+    )
 
     for batch in dataloader:
         print("\n--- TEST NẠP BATCH THÀNH CÔNG ---")

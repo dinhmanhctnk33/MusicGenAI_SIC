@@ -8,26 +8,25 @@ import soundfile as sf
 import torch
 from transformers import AutoProcessor, EncodecModel, T5EncoderModel, T5Tokenizer
 
+from config import (
+    CHECKPOINT_DIR,
+    DATA_CONFIG,
+    GENERATION_CONFIG,
+    MODEL_CONFIG,
+)
 from model import MusicGenTransformer
-
-
-DEFAULT_CONFIG = {
-    "codebook_size": 1024,
-    "num_codebooks": 4,
-    "text_dim": 768,
-    "d_model": 256,
-    "num_layers": 4,
-    "nhead": 8,
-    "dim_feedforward": 1024,
-    "max_seq_len": 512,
-}
 
 
 class MusicGenTester:
     """Generate audio from a text prompt using a trained checkpoint."""
 
-    def __init__(self, checkpoint_path, t5_model_name="t5-base",
-                 encodec_model_name="facebook/encodec_32khz", device=None):
+    def __init__(
+        self,
+        checkpoint_path,
+        t5_model_name=DATA_CONFIG["t5_model_name"],
+        encodec_model_name=DATA_CONFIG["encodec_model_name"],
+        device=None,
+    ):
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.device = torch.device(device)
         print(f"-> Device: {self.device}")
@@ -44,7 +43,7 @@ class MusicGenTester:
         saved_config = checkpoint.get("config", {})
         model_config = {
             key: saved_config.get(key, default)
-            for key, default in DEFAULT_CONFIG.items()
+            for key, default in MODEL_CONFIG.items()
         }
         if not saved_config:
             print("-> Warning: checkpoint has no config; using training defaults.")
@@ -65,19 +64,25 @@ class MusicGenTester:
         print("-> Checkpoint loaded successfully.")
 
     @torch.inference_mode()
-    def generate_music(self, prompt, output_path="generated_sample.mp3",
-                       duration_sec=5.0, temperature=1.0, top_k=250):
+    def generate_music(
+        self,
+        prompt,
+        output_path=GENERATION_CONFIG["output_path"],
+        duration_sec=GENERATION_CONFIG["duration_sec"],
+        temperature=GENERATION_CONFIG["temperature"],
+        top_k=GENERATION_CONFIG["top_k"],
+    ):
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("Prompt must not be empty.")
         if duration_sec <= 0:
             raise ValueError("duration_sec must be greater than zero.")
 
-        # EnCodec 32 kHz produces approximately 50 frames per second.
-        max_steps = round(duration_sec * 50)
+        frames_per_second = GENERATION_CONFIG["frames_per_second"]
+        max_steps = round(duration_sec * frames_per_second)
         max_allowed_steps = self.max_seq_len - self.model.num_codebooks + 1
         if max_steps > max_allowed_steps:
-            max_duration = max_allowed_steps / 50
+            max_duration = max_allowed_steps / frames_per_second
             raise ValueError(
                 f"Maximum duration is about {max_duration:.2f}s "
                 f"for max_seq_len={self.max_seq_len}."
@@ -85,7 +90,9 @@ class MusicGenTester:
 
         print(f"\n[1/3] Processing prompt: {prompt!r}")
         text_inputs = self.t5_tokenizer(
-            prompt, padding="max_length", max_length=64,
+            prompt,
+            padding="max_length",
+            max_length=DATA_CONFIG["text_max_length"],
             truncation=True, return_tensors="pt"
         )
         input_ids = text_inputs.input_ids.to(self.device)
@@ -124,7 +131,12 @@ class MusicGenTester:
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
                 temp_path = temp_file.name
-            sf.write(temp_path, waveform, 32000, subtype="PCM_16")
+            sf.write(
+                temp_path,
+                waveform,
+                DATA_CONFIG["sample_rate"],
+                subtype="PCM_16",
+            )
             subprocess.run(
                 [
                     ffmpeg_path,
@@ -154,17 +166,21 @@ def parse_args():
     )
     parser.add_argument(
         "--checkpoint",
-        default=os.path.join("checkpoints", "latest_musicgen_model.pt"),
+        default=str(CHECKPOINT_DIR / "latest_musicgen_model.pt"),
         help="Checkpoint .pt path (mounted Google Drive paths are supported).",
     )
     parser.add_argument(
         "--prompt",
-        default="A joyful upbeat Rock track with electric guitar and energetic drums.",
+        default=GENERATION_CONFIG["prompt"],
     )
-    parser.add_argument("--output", default="generated_sample.mp3")
-    parser.add_argument("--duration", type=float, default=5.0)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-k", type=int, default=250)
+    parser.add_argument("--output", default=GENERATION_CONFIG["output_path"])
+    parser.add_argument(
+        "--duration", type=float, default=GENERATION_CONFIG["duration_sec"]
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=GENERATION_CONFIG["temperature"]
+    )
+    parser.add_argument("--top-k", type=int, default=GENERATION_CONFIG["top_k"])
     parser.add_argument("--device", choices=["cpu", "cuda"], default=None)
     return parser.parse_args()
 

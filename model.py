@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from config import MODEL_CONFIG
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -38,15 +40,15 @@ class MusicGenTransformer(nn.Module):
 
     def __init__(
             self,
-            codebook_size: int = 1024,
-            num_codebooks: int = 4,
-            text_dim: int = 768,  # Chiều ẩn từ T5-base
-            d_model: int = 256,  # Cấu hình phù hợp GPU 4 GB
-            nhead: int = 8,
-            num_layers: int = 4,
-            dim_feedforward: int = 1024,
-            dropout: float = 0.1,
-            max_seq_len: int = 512
+            codebook_size: int = MODEL_CONFIG["codebook_size"],
+            num_codebooks: int = MODEL_CONFIG["num_codebooks"],
+            text_dim: int = MODEL_CONFIG["text_dim"],
+            d_model: int = MODEL_CONFIG["d_model"],
+            nhead: int = MODEL_CONFIG["nhead"],
+            num_layers: int = MODEL_CONFIG["num_layers"],
+            dim_feedforward: int = MODEL_CONFIG["dim_feedforward"],
+            dropout: float = MODEL_CONFIG["dropout"],
+            max_seq_len: int = MODEL_CONFIG["max_seq_len"],
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -298,7 +300,7 @@ if __name__ == "__main__":
 
     # Cấu hình thử nghiệm
     batch_size = 1
-    num_codebooks = 4
+    num_codebooks = MODEL_CONFIG["num_codebooks"]
     audio_seq_len = 250  # 5 giây, an toàn hơn với GPU 4 GB
     text_seq_len = 64
 
@@ -306,24 +308,26 @@ if __name__ == "__main__":
     print(f"Đang sử dụng thiết bị: {device}")
 
     # Tạo giả lập dữ liệu đầu vào từ data.py
-    dummy_audio_tokens = torch.randint(0, 1024, (batch_size, num_codebooks, audio_seq_len)).to(device)
-    dummy_text_embeddings = torch.randn(batch_size, text_seq_len, 768).to(device)
+    dummy_audio_tokens = torch.randint(
+        0,
+        MODEL_CONFIG["codebook_size"],
+        (batch_size, num_codebooks, audio_seq_len),
+        device=device,
+    )
+    dummy_text_embeddings = torch.randn(
+        batch_size, text_seq_len, MODEL_CONFIG["text_dim"], device=device
+    )
 
     # Khởi tạo mô hình MusicGen Transformer
-    model = MusicGenTransformer(
-        codebook_size=1024,
-        num_codebooks=num_codebooks,
-        text_dim=768,
-        d_model=256,
-        num_layers=4,
-        dim_feedforward=1024,
-        nhead=8
-    ).to(device)
+    model = MusicGenTransformer(**MODEL_CONFIG).to(device)
 
     # 1. Test Forward Pass (Dùng trong Training)
     logits = model(dummy_audio_tokens, dummy_text_embeddings)
     print(f"-> Forward Logits Output Shape: {list(logits.shape)}")
-    print("   (Kỳ vọng: [Batch, Codebooks, SeqLen, CodebookSize] -> [1, 4, 250, 1024])")
+    print(
+        "   Kỳ vọng: [Batch, Codebooks, SeqLen, CodebookSize] -> "
+        f"[1, {num_codebooks}, {audio_seq_len}, {MODEL_CONFIG['codebook_size']}]"
+    )
 
     # 2. Test Generation / Sampling Pass (Dùng trong Inference)
     print("\nĐang chạy thử nghiệm hàm generate (sinh 10 bước token)...")

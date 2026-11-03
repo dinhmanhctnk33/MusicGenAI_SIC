@@ -8,6 +8,12 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, random_split
 
+from config import (
+    ARCHITECTURE_KEYS,
+    CHECKPOINT_DIR,
+    MODEL_CONFIG,
+    build_run_config,
+)
 from data import create_dataloader
 from model import MusicGenTransformer
 
@@ -15,30 +21,6 @@ from model import MusicGenTransformer
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
-
-# Cấu hình nhỏ, phù hợp RTX 2050 4 GB.
-TRAIN_CONFIG = {
-    "batch_size": 1,
-    "epochs": 20,
-    "learning_rate": 1e-4,
-    "weight_decay": 1e-2,
-    "audio_duration": 5.0,
-    "gradient_accumulation_steps": 8,
-    "validation_ratio": 0.05,
-    "test_ratio": 0.05,
-    "early_stopping_patience": 4,
-    "encoder_device": "cpu",
-    "cfg_drop_prob": 0.1,
-    "codebook_size": 1024,
-    "num_codebooks": 4,
-    "text_dim": 768,
-    "d_model": 256,
-    "num_layers": 4,
-    "nhead": 8,
-    "dim_feedforward": 1024,
-    "max_seq_len": 512,
-}
 
 
 def _compute_loss(model, batch, criterion, device, use_amp, cfg_drop_prob=0.0):
@@ -98,6 +80,8 @@ def train_epoch(
     device,
     accumulation_steps=8,
     cfg_drop_prob=0.1,
+    gradient_clip_norm=1.0,
+    log_every_batches=10,
 ):
     model.train()
     total_loss = 0.0
@@ -122,14 +106,16 @@ def train_epoch(
         is_last_batch = (batch_idx + 1) == len(dataloader)
         if is_update_step or is_last_batch:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=gradient_clip_norm
+            )
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
         total_loss += loss.detach().item()
         total_codebook_losses += codebook_losses.double().cpu()
-        if (batch_idx + 1) % 10 == 0 or is_last_batch:
+        if (batch_idx + 1) % log_every_batches == 0 or is_last_batch:
             print(
                 f"   Batch [{batch_idx + 1}/{len(dataloader)}] "
                 f"- Loss: {loss.item():.4f}"
@@ -187,19 +173,28 @@ def _create_data_loaders(config):
         auto_download=True,
         num_workers=0,
         device=config["encoder_device"],
+        use_cache=config["use_encoded_cache"],
     )
     dataset = full_loader.dataset
+    if config["precompute_cache"]:
+        dataset.populate_cache()
+        dataset.release_encoders()
 
     validation_size = max(1, int(len(dataset) * config["validation_ratio"]))
     test_size = max(1, int(len(dataset) * config["test_ratio"]))
     train_size = len(dataset) - validation_size - test_size
     if train_size < 1:
         raise ValueError("Dataset quá nhỏ để chia train/validation/test.")
-    generator = torch.Generator().manual_seed(42)
+    generator = torch.Generator().manual_seed(config["random_seed"])
     train_subset, validation_subset, test_subset = random_split(
         dataset, [train_size, validation_size, test_size], generator=generator
     )
-    train_dataset = CropModeDataset(train_subset, random_crop=True)
+    cache_is_precomputed = (
+        config["use_encoded_cache"] and config["precompute_cache"]
+    )
+    train_dataset = CropModeDataset(
+        train_subset, random_crop=not cache_is_precomputed
+    )
     validation_dataset = CropModeDataset(validation_subset, random_crop=False)
     test_dataset = CropModeDataset(test_subset, random_crop=False)
 
@@ -220,13 +215,9 @@ def _load_checkpoint(path, model, optimizer, scheduler, scaler, device, config):
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     saved_config = checkpoint.get("config", {})
-    architecture_keys = (
-        "codebook_size", "num_codebooks", "text_dim", "d_model",
-        "num_layers", "nhead", "dim_feedforward", "max_seq_len",
-    )
     mismatches = [
         f"{key}: checkpoint={saved_config.get(key)!r}, current={config[key]!r}"
-        for key in architecture_keys
+        for key in ARCHITECTURE_KEYS
         if saved_config.get(key) != config[key]
     ]
     if mismatches:
@@ -251,7 +242,7 @@ def _load_checkpoint(path, model, optimizer, scheduler, scaler, device, config):
 
 
 def train_model():
-    config = TRAIN_CONFIG.copy()
+    config = build_run_config()
     print("=" * 60)
     print("      MUSIC GENAI - HUẤN LUYỆN MÔ HÌNH (TRAIN.PY)")
     print("=" * 60)
@@ -263,9 +254,7 @@ def train_model():
     else:
         print("Cảnh báo: CUDA không khả dụng; training sẽ rất chậm trên CPU.")
 
-    checkpoint_dir = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "checkpoints"
-    )
+    checkpoint_dir = str(CHECKPOINT_DIR)
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, "latest_musicgen_model.pt")
     best_checkpoint_path = os.path.join(checkpoint_dir, "best_musicgen_model.pt")
@@ -280,16 +269,7 @@ def train_model():
     print(f"Thiết bị encoder T5/EnCodec: {config['encoder_device']}")
 
     print("\n[2/4] Đang khởi tạo MusicGen Transformer...")
-    model = MusicGenTransformer(
-        codebook_size=config["codebook_size"],
-        num_codebooks=config["num_codebooks"],
-        text_dim=config["text_dim"],
-        d_model=config["d_model"],
-        num_layers=config["num_layers"],
-        nhead=config["nhead"],
-        dim_feedforward=config["dim_feedforward"],
-        max_seq_len=config["max_seq_len"],
-    ).to(device)
+    model = MusicGenTransformer(**MODEL_CONFIG).to(device)
 
     optimizer = AdamW(
         model.parameters(),
@@ -321,6 +301,8 @@ def train_model():
             device,
             accumulation_steps=config["gradient_accumulation_steps"],
             cfg_drop_prob=config["cfg_drop_prob"],
+            gradient_clip_norm=config["gradient_clip_norm"],
+            log_every_batches=config["log_every_batches"],
         )
         validation_loss, validation_codebook_losses = validate(
             model, validation_loader, criterion, device
