@@ -3,12 +3,14 @@ name = "d-n-music-genai"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.115",
     "pandas>=3.1.0",
     "soundfile>=0.14.0",
     "torch==2.15.0+cu132",
     "torchaudio==2.11.1+cu132",
     "torchcodec>=0.17.0",
     "transformers>=5.22.1",
+    "uvicorn>=0.34",
 ]
 
 [[tool.uv.index]]

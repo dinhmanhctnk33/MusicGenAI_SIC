@@ -1,8 +1,10 @@
 .venv/
+.uv-cache/
 .idea/
 __pycache__/
 *.py[cod]
 checkpoints/
 dataset/
 unused/
-
+outputs/
+musicgen_history.sqlite3

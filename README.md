@@ -102,25 +102,27 @@ Mọi hyperparameter được khai báo tập trung trong `config.py`. Nên ch�
 
 Cấu hình huấn luyện hiện tại:
 
-- Tối đa 20 epoch, early stopping sau 4 epoch không cải thiện
+- Tối đa 30 epoch, early stopping sau 5 epoch không cải thiện
 - Batch size 1
-- Gradient accumulation 8 bước
+- Gradient accumulation 16 bước
 - Automatic Mixed Precision FP16 trên CUDA
 - Gradient clipping với `max_norm=1.0`
 - AdamW và Cosine Annealing learning-rate scheduler
-- Classifier-free guidance dropout 10%
+- Classifier-free guidance dropout 10%, guidance scale mặc định 2.5
 - Chia dữ liệu theo tỷ lệ **90% train / 5% validation / 5% test**
-- T5 và EnCodec mã hóa mỗi track một lần, sau đó lưu tensor cache trong `dataset/encoded_cache_v1`
-- Cache dùng crop cố định ở giữa bài để các epoch sau không phải chạy lại T5/EnCodec
-- GPU từ 8 GB trở lên tự dùng CUDA khi tạo cache; GPU 4 GB dùng CPU để tránh tràn VRAM
+- Mỗi track được chia thành 6 crop cố định, phủ từ đầu đến cuối bài
+- T5 và EnCodec mã hóa theo batch 8 và lưu trong `dataset/encoded_cache_v2_multicrop`
+- Train/validation/test chia theo track, không để crop của cùng bài rò sang tập khác
+- Training dùng weighted sampler để cân bằng các genre
+- GPU từ 4 GB trở lên tự dùng CUDA FP16 khi tạo cache
 
 Validation set được đánh giá sau mỗi epoch để lưu best checkpoint và early stopping. Test set chỉ được đánh giá một lần sau khi train.
 
 Checkpoint mới nhất được lưu tại:
 
 ```text
-checkpoints/latest_musicgen_model.pt
-checkpoints/best_musicgen_model.pt
+checkpoints/scratch_v2/latest_musicgen_model.pt
+checkpoints/scratch_v2/best_musicgen_model.pt
 ```
 
 Checkpoint chứa trạng thái model, optimizer, scheduler, AMP scaler, epoch, training loss và cấu hình.
@@ -129,17 +131,30 @@ Lần chạy đầu sẽ tạo cache và có thể mất nhiều thời gian. C�
 
 ## Tiếp tục huấn luyện
 
-Trong Command Prompt:
+Nếu `checkpoints/scratch_v2/latest_musicgen_model.pt` tồn tại, lệnh sau tự động
+tiếp tục từ epoch đã lưu:
 
-```cmd
-set MUSICGEN_RESUME=checkpoints\latest_musicgen_model.pt
-.\.venv\Scripts\python.exe train.py
+```powershell
+uv run train.py
 ```
 
-Để bắt đầu lại từ đầu, mở cửa sổ CMD mới hoặc xóa biến môi trường:
+## Giao diện MusicGenAI Studio
 
-```cmd
-set MUSICGEN_RESUME=
+Khởi động hệ thống local:
+
+```powershell
+uv run frontend/app.py
+```
+
+Trình duyệt sẽ mở `http://127.0.0.1:7860`. Hệ thống sử dụng
+`frontend/index.html`, `frontend/style.css` và `frontend/app.js`, hỗ trợ sinh nhạc,
+nghe WAV và lưu lịch sử hội thoại bằng SQLite.
+
+Để cố ý train lại từ đầu trong PowerShell:
+
+```powershell
+$env:MUSICGEN_RESUME="none"
+uv run train.py
 ```
 
 ## Lưu ý

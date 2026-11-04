@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 
 from config import (
     ARCHITECTURE_KEYS,
@@ -21,6 +21,12 @@ from model import MusicGenTransformer
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _set_random_seed(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _compute_loss(model, batch, criterion, device, use_amp, cfg_drop_prob=0.0):
@@ -180,15 +186,39 @@ def _create_data_loaders(config):
         dataset.populate_cache()
         dataset.release_encoders()
 
-    validation_size = max(1, int(len(dataset) * config["validation_ratio"]))
-    test_size = max(1, int(len(dataset) * config["test_ratio"]))
-    train_size = len(dataset) - validation_size - test_size
-    if train_size < 1:
+    # Chia theo track trước, sau đó mới mở rộng sang các segment.
+    # Như vậy các crop của cùng bài không thể rò sang test set.
+    track_count = len(dataset.track_ids)
+    validation_tracks = max(1, int(track_count * config["validation_ratio"]))
+    test_tracks = max(1, int(track_count * config["test_ratio"]))
+    train_tracks = track_count - validation_tracks - test_tracks
+    if train_tracks < 1:
         raise ValueError("Dataset quá nhỏ để chia train/validation/test.")
     generator = torch.Generator().manual_seed(config["random_seed"])
-    train_subset, validation_subset, test_subset = random_split(
-        dataset, [train_size, validation_size, test_size], generator=generator
-    )
+    shuffled_track_indices = torch.randperm(track_count, generator=generator).tolist()
+    train_track_ids = {
+        dataset.track_ids[i] for i in shuffled_track_indices[:train_tracks]
+    }
+    validation_track_ids = {
+        dataset.track_ids[i]
+        for i in shuffled_track_indices[train_tracks:train_tracks + validation_tracks]
+    }
+    test_track_ids = {
+        dataset.track_ids[i] for i in shuffled_track_indices[train_tracks + validation_tracks:]
+    }
+    train_indices, validation_indices, test_indices = [], [], []
+    for sample_idx in range(len(dataset)):
+        track_id = dataset.sample_track_id(sample_idx)
+        if track_id in train_track_ids:
+            train_indices.append(sample_idx)
+        elif track_id in validation_track_ids:
+            validation_indices.append(sample_idx)
+        elif track_id in test_track_ids:
+            test_indices.append(sample_idx)
+
+    train_subset = Subset(dataset, train_indices)
+    validation_subset = Subset(dataset, validation_indices)
+    test_subset = Subset(dataset, test_indices)
     cache_is_precomputed = (
         config["use_encoded_cache"] and config["precompute_cache"]
     )
@@ -203,7 +233,20 @@ def _create_data_loaders(config):
         "num_workers": 0,
         "pin_memory": torch.cuda.is_available(),
     }
-    train_loader = DataLoader(train_dataset, shuffle=True, **common)
+    genre_counts = {}
+    train_genres = []
+    for source_idx in train_indices:
+        genre = dataset.sample_genre(source_idx)
+        train_genres.append(genre)
+        genre_counts[genre] = genre_counts.get(genre, 0) + 1
+    sample_weights = [1.0 / genre_counts[genre] for genre in train_genres]
+    sampler = WeightedRandomSampler(
+        sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+        generator=torch.Generator().manual_seed(config["random_seed"]),
+    )
+    train_loader = DataLoader(train_dataset, sampler=sampler, **common)
     validation_loader = DataLoader(validation_dataset, shuffle=False, **common)
     test_loader = DataLoader(test_dataset, shuffle=False, **common)
     return train_loader, validation_loader, test_loader
@@ -243,6 +286,7 @@ def _load_checkpoint(path, model, optimizer, scheduler, scaler, device, config):
 
 def train_model():
     config = build_run_config()
+    _set_random_seed(config["random_seed"])
     print("=" * 60)
     print("      MUSIC GENAI - HUẤN LUYỆN MÔ HÌNH (TRAIN.PY)")
     print("=" * 60)
@@ -254,7 +298,7 @@ def train_model():
     else:
         print("Cảnh báo: CUDA không khả dụng; training sẽ rất chậm trên CPU.")
 
-    checkpoint_dir = str(CHECKPOINT_DIR)
+    checkpoint_dir = str(CHECKPOINT_DIR / config["run_name"])
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, "latest_musicgen_model.pt")
     best_checkpoint_path = os.path.join(checkpoint_dir, "best_musicgen_model.pt")
@@ -276,12 +320,23 @@ def train_model():
         lr=config["learning_rate"],
         weight_decay=config["weight_decay"],
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=config["epochs"])
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=config["epochs"],
+        eta_min=config["min_learning_rate"],
+    )
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    # Đặt MUSICGEN_RESUME thành đường dẫn checkpoint nếu muốn tiếp tục training.
-    resume_path = os.environ.get("MUSICGEN_RESUME")
+    # Mặc định tiếp tục latest checkpoint nếu có. Có thể ép train
+    # lại từ đầu bằng MUSICGEN_RESUME=none, hoặc chỉ định checkpoint khác.
+    resume_setting = os.environ.get("MUSICGEN_RESUME", "auto").strip()
+    if resume_setting.lower() == "auto":
+        resume_path = checkpoint_path if os.path.isfile(checkpoint_path) else None
+    elif resume_setting.lower() in {"none", "off", "false", "0"}:
+        resume_path = None
+    else:
+        resume_path = resume_setting
     start_epoch, last_loss, best_validation_loss = _load_checkpoint(
         resume_path, model, optimizer, scheduler, scaler, device, config
     )

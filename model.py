@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import MODEL_CONFIG
+from config import GENERATION_CONFIG, MODEL_CONFIG
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -228,13 +228,16 @@ class MusicGenTransformer(nn.Module):
             text_attention_mask: torch.Tensor = None,
             max_steps: int = 500,
             temperature: float = 1.0,
-            top_k: int = 250
+            top_k: int = 250,
+            guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         """
         Inference / Sampling tự hồi quy để sinh ra chuỗi Acoustic Tokens từ Text Embedding.
         """
         if temperature <= 0:
             raise ValueError("temperature phải lớn hơn 0.")
+        if guidance_scale < 1.0:
+            raise ValueError("guidance_scale phải >= 1.0.")
         max_audio_steps = self.max_seq_len - self.num_codebooks + 1
         if max_steps < 1 or max_steps > max_audio_steps:
             raise ValueError(
@@ -256,10 +259,31 @@ class MusicGenTransformer(nn.Module):
         try:
             pattern_steps = max_steps + self.num_codebooks - 1
             for pattern_idx in range(pattern_steps):
-                logits = self._decode(
-                    delayed_tokens, text_embeddings,
-                    text_attention_mask=text_attention_mask
-                )
+                if guidance_scale > 1.0:
+                    # Chạy conditional/unconditional trong cùng một batch để CFG
+                    # chỉ tốn một forward pass cho mỗi bước autoregressive.
+                    cfg_tokens = torch.cat([delayed_tokens, delayed_tokens], dim=0)
+                    cfg_embeddings = torch.cat(
+                        [torch.zeros_like(text_embeddings), text_embeddings], dim=0
+                    )
+                    cfg_mask = None
+                    if text_attention_mask is not None:
+                        cfg_mask = torch.cat(
+                            [text_attention_mask, text_attention_mask], dim=0
+                        )
+                    uncond_logits, cond_logits = self._decode(
+                        cfg_tokens,
+                        cfg_embeddings,
+                        text_attention_mask=cfg_mask,
+                    ).chunk(2, dim=0)
+                    logits = uncond_logits + guidance_scale * (
+                        cond_logits - uncond_logits
+                    )
+                else:
+                    logits = self._decode(
+                        delayed_tokens, text_embeddings,
+                        text_attention_mask=text_attention_mask
+                    )
                 next_logits = logits[:, :, -1, :] / temperature
                 next_frame = torch.full(
                     (bs, self.num_codebooks), self.codebook_size,
@@ -331,6 +355,13 @@ if __name__ == "__main__":
 
     # 2. Test Generation / Sampling Pass (Dùng trong Inference)
     print("\nĐang chạy thử nghiệm hàm generate (sinh 10 bước token)...")
-    gen_tokens = model.generate(dummy_text_embeddings, max_steps=10)
+    gen_tokens = model.generate(
+        dummy_text_embeddings,
+        text_attention_mask=torch.ones(
+            batch_size, text_seq_len, dtype=torch.long, device=device
+        ),
+        max_steps=10,
+        guidance_scale=GENERATION_CONFIG["guidance_scale"],
+    )
     print(f"-> Generated Tokens Output Shape: {list(gen_tokens.shape)}")
     print("   (Kỳ vọng: [Batch, Codebooks, Steps] -> [1, 4, 10])")
