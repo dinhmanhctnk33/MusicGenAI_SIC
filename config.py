@@ -12,6 +12,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATASET_DIR = PROJECT_ROOT / "dataset"
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+CODEC_CHECKPOINT_DIR = CHECKPOINT_DIR / "neural_codec_v1"
 
 
 def recommended_encoder_device() -> str:
@@ -38,30 +39,57 @@ DATA_CONFIG = {
     "audio_duration": 5.0,
     "segments_per_track": 6,
     "cache_batch_size": 8,
+    # Sau khi precompute cache, cac worker chi doc tensor nho tu dia.
+    # Gioi han 4 de tranh ton RAM/IO qua muc tren Windows va o OneDrive.
+    "num_workers": min(4, max(0, (os.cpu_count() or 2) - 1)),
+    "prefetch_factor": 2,
     "minimum_audio_duration": 1.0,
     "audio_token_rate": 50,
     "text_max_length": 64,
-    "t5_model_name": "t5-base",
-    "encodec_model_name": "facebook/encodec_32khz",
+    "text_vocab_size": 259,
     "min_audio_rms": 1e-4,
     "max_prompt_field_length": 200,
-    "cache_version": "v2_multicrop",
-    "run_name": "scratch_v2",
+    "cache_version": "v5_neural_codec_bilingual",
+    "run_name": "neural_codec_bilingual_v5",
     "use_encoded_cache": True,
     "precompute_cache": True,
     "encoder_device": recommended_encoder_device(),
 }
 
 MODEL_CONFIG = {
-    "codebook_size": 2_048,
-    "num_codebooks": 4,
-    "text_dim": 768,
+    "codebook_size": 1_024,
+    # 8 x 1024 code o 50 Hz = 4 kbps; du bang thong cho nhac hon codec 4 codebook.
+    "num_codebooks": 8,
+    "text_dim": 384,
+    "text_num_layers": 4,
+    "text_nhead": 8,
+    "text_dim_feedforward": 1_024,
     "d_model": 384,
     "num_layers": 6,
     "nhead": 8,
     "dim_feedforward": 1_536,
     "dropout": 0.1,
     "max_seq_len": 512,
+}
+
+CODEC_CONFIG = {
+    "latent_dim": 128,
+    "num_codebooks": MODEL_CONFIG["num_codebooks"],
+    "codebook_size": MODEL_CONFIG["codebook_size"],
+    "base_channels": 32,
+}
+
+CODEC_TRAIN_CONFIG = {
+    "audio_duration": 2.0,
+    "batch_size": 2,
+    "epochs": 50,
+    "learning_rate": 2e-4,
+    "weight_decay": 1e-4,
+    "commitment_weight": 1.0,
+    "stft_weight": 1.0,
+    "waveform_weight": 1.0,
+    "validation_ratio": 0.02,
+    "early_stopping_patience": 7,
 }
 
 TRAIN_CONFIG = {

@@ -27,6 +27,8 @@ def _set_random_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
 
 def _compute_loss(model, batch, criterion, device, use_amp, cfg_drop_prob=0.0):
@@ -39,17 +41,17 @@ def _compute_loss(model, batch, criterion, device, use_amp, cfg_drop_prob=0.0):
             f"min={token_min}, max={token_max}."
         )
     audio_tokens = audio_tokens_cpu.to(device, non_blocking=True)
-    text_embeddings = batch["text_embeddings"].to(device, non_blocking=True)
+    text_embeddings = batch["text_token_ids"].to(device, non_blocking=True)
     text_attention_mask = batch["text_attention_mask"].to(device, non_blocking=True)
 
     # Classifier-free guidance dropout. Giữ attention mask gốc để tránh một hàng
     # memory bị mask hoàn toàn và sinh NaN trong cross-attention.
     if cfg_drop_prob > 0:
         drop_mask = (
-            torch.rand(text_embeddings.shape[0], 1, 1, device=device)
+            torch.rand(text_embeddings.shape[0], 1, device=device)
             < cfg_drop_prob
         )
-        text_embeddings = text_embeddings.masked_fill(drop_mask, 0.0)
+        text_embeddings = text_embeddings.masked_fill(drop_mask, 0)
 
     with torch.autocast(
         device_type=device.type,
@@ -74,7 +76,11 @@ def _compute_loss(model, batch, criterion, device, use_amp, cfg_drop_prob=0.0):
             for k in range(logits.size(1))
         ])
 
-    return loss, codebook_losses
+    predictions = logits.detach().argmax(dim=-1)
+    codebook_correct = (predictions == audio_tokens).sum(dim=(0, 2)).cpu()
+    tokens_per_codebook = audio_tokens.size(0) * audio_tokens.size(2)
+
+    return loss, codebook_losses, codebook_correct, tokens_per_codebook
 
 
 def train_epoch(
@@ -92,11 +98,13 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     total_codebook_losses = torch.zeros(model.num_codebooks, dtype=torch.float64)
+    total_codebook_correct = torch.zeros(model.num_codebooks, dtype=torch.long)
+    total_tokens_per_codebook = 0
     optimizer.zero_grad(set_to_none=True)
     use_amp = device.type == "cuda"
 
     for batch_idx, batch in enumerate(dataloader):
-        loss, codebook_losses = _compute_loss(
+        loss, codebook_losses, codebook_correct, token_count = _compute_loss(
             model,
             batch,
             criterion,
@@ -121,14 +129,28 @@ def train_epoch(
 
         total_loss += loss.detach().item()
         total_codebook_losses += codebook_losses.double().cpu()
+        total_codebook_correct += codebook_correct
+        total_tokens_per_codebook += token_count
         if (batch_idx + 1) % log_every_batches == 0 or is_last_batch:
+            running_accuracy = (
+                total_codebook_correct.sum().item()
+                / max(total_tokens_per_codebook * model.num_codebooks, 1)
+            )
             print(
                 f"   Batch [{batch_idx + 1}/{len(dataloader)}] "
-                f"- Loss: {loss.item():.4f}"
+                f"- Loss: {loss.item():.4f} "
+                f"- Running Accuracy: {running_accuracy * 100:.2f}%"
             )
 
     denominator = max(len(dataloader), 1)
-    return total_loss / denominator, total_codebook_losses / denominator
+    codebook_accuracy = total_codebook_correct.double() / max(total_tokens_per_codebook, 1)
+    accuracy = codebook_accuracy.mean().item()
+    return (
+        total_loss / denominator,
+        total_codebook_losses / denominator,
+        accuracy,
+        codebook_accuracy,
+    )
 
 
 @torch.no_grad()
@@ -136,10 +158,12 @@ def validate(model, dataloader, criterion, device):
     model.eval()
     total_loss = 0.0
     total_codebook_losses = torch.zeros(model.num_codebooks, dtype=torch.float64)
+    total_codebook_correct = torch.zeros(model.num_codebooks, dtype=torch.long)
+    total_tokens_per_codebook = 0
     use_amp = device.type == "cuda"
 
     for batch in dataloader:
-        loss, codebook_losses = _compute_loss(
+        loss, codebook_losses, codebook_correct, token_count = _compute_loss(
             model,
             batch,
             criterion,
@@ -149,9 +173,18 @@ def validate(model, dataloader, criterion, device):
         )
         total_loss += loss.item()
         total_codebook_losses += codebook_losses.double().cpu()
+        total_codebook_correct += codebook_correct
+        total_tokens_per_codebook += token_count
 
     denominator = max(len(dataloader), 1)
-    return total_loss / denominator, total_codebook_losses / denominator
+    codebook_accuracy = total_codebook_correct.double() / max(total_tokens_per_codebook, 1)
+    accuracy = codebook_accuracy.mean().item()
+    return (
+        total_loss / denominator,
+        total_codebook_losses / denominator,
+        accuracy,
+        codebook_accuracy,
+    )
 
 
 class CropModeDataset(Dataset):
@@ -230,9 +263,14 @@ def _create_data_loaders(config):
 
     common = {
         "batch_size": config["batch_size"],
-        "num_workers": 0,
+        "num_workers": config["num_workers"],
         "pin_memory": torch.cuda.is_available(),
     }
+    if config["num_workers"] > 0:
+        common.update({
+            "persistent_workers": True,
+            "prefetch_factor": config["prefetch_factor"],
+        })
     genre_counts = {}
     train_genres = []
     for source_idx in train_indices:
@@ -310,16 +348,23 @@ def train_model():
         f"Validation: {len(validation_loader.dataset)} | "
         f"Test: {len(test_loader.dataset)}"
     )
-    print(f"Thiết bị encoder T5/EnCodec: {config['encoder_device']}")
+    print(
+        f"DataLoader workers: {config['num_workers']} | "
+        f"Prefetch/worker: {config['prefetch_factor']} | "
+        f"Encoded cache: {'bat' if config['use_encoded_cache'] else 'tat'}"
+    )
+    print("Text encoder va audio codec: tu xay dung, khong pretrained.")
 
     print("\n[2/4] Đang khởi tạo MusicGen Transformer...")
     model = MusicGenTransformer(**MODEL_CONFIG).to(device)
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=config["learning_rate"],
-        weight_decay=config["weight_decay"],
-    )
+    optimizer_kwargs = {
+        "lr": config["learning_rate"],
+        "weight_decay": config["weight_decay"],
+    }
+    if device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    optimizer = AdamW(model.parameters(), **optimizer_kwargs)
     scheduler = CosineAnnealingLR(
         optimizer,
         T_max=config["epochs"],
@@ -347,7 +392,7 @@ def train_model():
         start_time = time.time()
         print(f"--- Epoch [{epoch}/{config['epochs']}] ---")
 
-        train_loss, train_codebook_losses = train_epoch(
+        train_loss, train_codebook_losses, train_accuracy, train_codebook_accuracy = train_epoch(
             model,
             train_loader,
             optimizer,
@@ -359,7 +404,7 @@ def train_model():
             gradient_clip_norm=config["gradient_clip_norm"],
             log_every_batches=config["log_every_batches"],
         )
-        validation_loss, validation_codebook_losses = validate(
+        validation_loss, validation_codebook_losses, validation_accuracy, validation_codebook_accuracy = validate(
             model, validation_loader, criterion, device
         )
         scheduler.step()
@@ -368,7 +413,9 @@ def train_model():
         print(
             f"Epoch {epoch} hoàn tất trong {elapsed:.1f}s | "
             f"Train Loss: {train_loss:.4f} | "
+            f"Train Accuracy: {train_accuracy * 100:.2f}% | "
             f"Validation Loss: {validation_loss:.4f} | "
+            f"Validation Accuracy: {validation_accuracy * 100:.2f}% | "
             f"LR: {optimizer.param_groups[0]['lr']:.2e}"
         )
         print(
@@ -383,6 +430,20 @@ def train_model():
             + ", ".join(
                 f"CB{k}={value:.4f}"
                 for k, value in enumerate(validation_codebook_losses.tolist())
+            )
+        )
+        print(
+            "   Train accuracy/codebook: "
+            + ", ".join(
+                f"CB{k}={value * 100:.2f}%"
+                for k, value in enumerate(train_codebook_accuracy.tolist())
+            )
+        )
+        print(
+            "   Validation accuracy/codebook: "
+            + ", ".join(
+                f"CB{k}={value * 100:.2f}%"
+                for k, value in enumerate(validation_codebook_accuracy.tolist())
             )
         )
 
@@ -402,6 +463,10 @@ def train_model():
             "scaler_state_dict": scaler.state_dict(),
             "training_loss": last_loss,
             "validation_loss": validation_loss,
+            "training_accuracy": train_accuracy,
+            "validation_accuracy": validation_accuracy,
+            "training_codebook_accuracy": train_codebook_accuracy.tolist(),
+            "validation_codebook_accuracy": validation_codebook_accuracy.tolist(),
             "best_validation_loss": best_validation_loss,
             "config": config,
         }
@@ -426,15 +491,23 @@ def train_model():
         )
         model.load_state_dict(best_checkpoint["model_state_dict"])
         print(f"Đã nạp best checkpoint từ epoch {best_checkpoint['epoch']}.")
-    test_loss, test_codebook_losses = validate(
+    test_loss, test_codebook_losses, test_accuracy, test_codebook_accuracy = validate(
         model, test_loader, criterion, device
     )
     print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
     print(
         "Test loss/codebook: "
         + ", ".join(
             f"CB{k}={value:.4f}"
             for k, value in enumerate(test_codebook_losses.tolist())
+        )
+    )
+    print(
+        "Test accuracy/codebook: "
+        + ", ".join(
+            f"CB{k}={value * 100:.2f}%"
+            for k, value in enumerate(test_codebook_accuracy.tolist())
         )
     )
 

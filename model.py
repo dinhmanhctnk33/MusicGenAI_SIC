@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import GENERATION_CONFIG, MODEL_CONFIG
+from scratch_components import ByteTokenizer, ScratchTextEncoder
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -43,6 +44,9 @@ class MusicGenTransformer(nn.Module):
             codebook_size: int = MODEL_CONFIG["codebook_size"],
             num_codebooks: int = MODEL_CONFIG["num_codebooks"],
             text_dim: int = MODEL_CONFIG["text_dim"],
+            text_num_layers: int = MODEL_CONFIG["text_num_layers"],
+            text_nhead: int = MODEL_CONFIG["text_nhead"],
+            text_dim_feedforward: int = MODEL_CONFIG["text_dim_feedforward"],
             d_model: int = MODEL_CONFIG["d_model"],
             nhead: int = MODEL_CONFIG["nhead"],
             num_layers: int = MODEL_CONFIG["num_layers"],
@@ -56,6 +60,16 @@ class MusicGenTransformer(nn.Module):
         self.d_model = d_model
         self.max_seq_len = max_seq_len
 
+        self.text_encoder = ScratchTextEncoder(
+            vocab_size=ByteTokenizer.VOCAB_SIZE,
+            d_model=text_dim,
+            max_length=64,
+            nhead=text_nhead,
+            num_layers=text_num_layers,
+            dim_feedforward=text_dim_feedforward,
+            dropout=dropout,
+        )
+
         if d_model % nhead != 0:
             raise ValueError("d_model phải chia hết cho nhead.")
 
@@ -65,7 +79,7 @@ class MusicGenTransformer(nn.Module):
             nn.Embedding(codebook_size + 1, d_model) for _ in range(num_codebooks)
         ])
 
-        # 2. Chiếu đặc trưng Text Embedding từ T5 (768 -> d_model)
+        # Chieu dac trung tu text encoder tu huan luyen sang decoder.
         self.text_projection = nn.Linear(text_dim, d_model, bias=False)
 
         # 3. Positional Encoding
@@ -104,7 +118,7 @@ class MusicGenTransformer(nn.Module):
 
         Args:
             target_tokens  : [batch_size, num_codebooks, seq_len] - Chuỗi token âm thanh
-            text_embeddings: [batch_size, text_seq_len, text_dim] - Vector điều kiện từ T5
+            text_embeddings: token ids [batch, text_seq] hoac hidden states [batch, text_seq, text_dim]
 
         Returns:
             logits: [batch_size, num_codebooks, seq_len, codebook_size]
@@ -147,6 +161,10 @@ class MusicGenTransformer(nn.Module):
         )
         decoder_tokens = torch.cat([bos, delayed_tokens[:, :, :-1]], dim=-1)
 
+        if text_embeddings.ndim == 2:
+            if text_attention_mask is None:
+                text_attention_mask = text_embeddings.ne(ByteTokenizer.PAD_ID)
+            text_embeddings = self.text_encoder(text_embeddings, text_attention_mask)
         delayed_logits = self._decode(
             decoder_tokens,
             text_embeddings,
@@ -243,6 +261,10 @@ class MusicGenTransformer(nn.Module):
             raise ValueError(
                 f"max_steps phải nằm trong [1, {max_audio_steps}]."
             )
+        if text_embeddings.ndim == 2:
+            if text_attention_mask is None:
+                text_attention_mask = text_embeddings.ne(ByteTokenizer.PAD_ID)
+            text_embeddings = self.text_encoder(text_embeddings, text_attention_mask)
         device = text_embeddings.device
         bs = text_embeddings.size(0)
 

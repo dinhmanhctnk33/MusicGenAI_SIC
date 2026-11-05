@@ -7,10 +7,13 @@ import tempfile
 import soundfile as sf
 import torch
 import torch.nn as nn
-from transformers import AutoProcessor, EncodecModel, T5EncoderModel, T5Tokenizer
+from audio_codec import load_codec_checkpoint
+from scratch_components import ByteTokenizer
 
 from config import (
     CHECKPOINT_DIR,
+    CODEC_CHECKPOINT_DIR,
+    CODEC_CONFIG,
     DATA_CONFIG,
     GENERATION_CONFIG,
     MODEL_CONFIG,
@@ -25,8 +28,6 @@ class MusicGenTester:
     def __init__(
         self,
         checkpoint_path,
-        t5_model_name=DATA_CONFIG["t5_model_name"],
-        encodec_model_name=DATA_CONFIG["encodec_model_name"],
         device=None,
     ):
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,13 +53,16 @@ class MusicGenTester:
         if not saved_config:
             print("-> Warning: checkpoint has no config; using training defaults.")
 
-        print("-> Loading T5 tokenizer and encoder...")
-        self.t5_tokenizer = T5Tokenizer.from_pretrained(t5_model_name)
-        self.t5_encoder = T5EncoderModel.from_pretrained(t5_model_name).to(self.device).eval()
-
-        print("-> Loading EnCodec processor and decoder...")
-        self.encodec_processor = AutoProcessor.from_pretrained(encodec_model_name)
-        self.encodec_model = EncodecModel.from_pretrained(encodec_model_name).to(self.device).eval()
+        self.text_tokenizer = ByteTokenizer()
+        codec_path = CODEC_CHECKPOINT_DIR / "best_codec.pt"
+        if not codec_path.is_file():
+            raise FileNotFoundError(
+                f"Neural codec checkpoint not found: {codec_path}. "
+                "Run 'uv run train_codec.py' first."
+            )
+        self.audio_codec = load_codec_checkpoint(
+            codec_path, self.device, CODEC_CONFIG
+        )
 
         print(f"-> Model config: {model_config}")
         self.model = MusicGenTransformer(**model_config).to(self.device)
@@ -100,21 +104,15 @@ class MusicGenTester:
             )
 
         print(f"\n[1/3] Processing prompt: {prompt!r}")
-        text_inputs = self.t5_tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=DATA_CONFIG["text_max_length"],
-            truncation=True, return_tensors="pt"
+        input_ids, attention_mask = self.text_tokenizer.encode(
+            prompt, DATA_CONFIG["text_max_length"]
         )
-        input_ids = text_inputs.input_ids.to(self.device)
-        attention_mask = text_inputs.attention_mask.to(self.device)
-        text_embeddings = self.t5_encoder(
-            input_ids=input_ids, attention_mask=attention_mask
-        ).last_hidden_state
+        input_ids = input_ids.unsqueeze(0).to(self.device)
+        attention_mask = attention_mask.unsqueeze(0).to(self.device)
 
         print(f"[2/3] Generating {max_steps} token steps ({duration_sec:.2f}s)...")
         generated_tokens = self.model.generate(
-            text_embeddings=text_embeddings,
+            text_embeddings=input_ids,
             text_attention_mask=attention_mask,
             max_steps=max_steps,
             temperature=temperature,
@@ -123,12 +121,10 @@ class MusicGenTester:
         )
 
         print("[3/3] Decoding tokens to waveform...")
-        # EnCodec expects [num_frames, batch, num_codebooks, frame_length].
-        audio_codes = generated_tokens.unsqueeze(0)
-        waveform = self.encodec_model.decode(audio_codes, [None]).audio_values
+        waveform = self.audio_codec.decode(generated_tokens)
         waveform = waveform[0].detach().float().cpu().transpose(0, 1).numpy()
 
-        # EnCodec có thể trả về tín hiệu khá nhỏ. Khử DC, nâng RMS lên
+        # Codec tu xay dung co the tra ve tin hieu nho. Khu DC, nang RMS len
         # khoảng -18 dBFS và giới hạn peak ở -1 dBFS để nghe rõ mà không vỡ tiếng.
         waveform = waveform - waveform.mean(axis=0, keepdims=True)
         rms = float((waveform ** 2).mean() ** 0.5)
@@ -232,10 +228,11 @@ def evaluate_test_set(checkpoint_path, device=None):
     criterion = nn.CrossEntropyLoss()
 
     print(f"-> Evaluating checkpoint from epoch {checkpoint.get('epoch', '?')}...")
-    test_loss, codebook_losses = validate(
+    test_loss, codebook_losses, test_accuracy, codebook_accuracy = validate(
         model, test_loader, criterion, device
     )
     print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Accuracy: {test_accuracy * 100:.2f}%")
     print(
         "Test loss/codebook: "
         + ", ".join(
@@ -243,7 +240,14 @@ def evaluate_test_set(checkpoint_path, device=None):
             for k, value in enumerate(codebook_losses.tolist())
         )
     )
-    return test_loss, codebook_losses
+    print(
+        "Test accuracy/codebook: "
+        + ", ".join(
+            f"CB{k}={value * 100:.2f}%"
+            for k, value in enumerate(codebook_accuracy.tolist())
+        )
+    )
+    return test_loss, codebook_losses, test_accuracy, codebook_accuracy
 
 
 def parse_args():

@@ -9,7 +9,6 @@ dependencies = [
     "torch==2.15.0+cu132",
     "torchaudio==2.11.1+cu132",
     "torchcodec>=0.17.0",
-    "transformers>=5.22.1",
     "uvicorn>=0.34",
 ]
 
