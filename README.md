@@ -6,19 +6,41 @@ huấn luyện trong dự án; không tải T5, EnCodec hay bất kỳ trọng s
 
 ## Kiến trúc
 
-```text
-Prompt Việt/Anh
-  → UTF-8 ByteTokenizer
-  → Transformer text encoder (4 lớp)
-  → Transformer decoder tự hồi quy (6 lớp, CFG)
-  → 8 luồng acoustic token
-  → RVQ + CNN audio decoder
-  → WAV 32 kHz
+```mermaid
+flowchart LR
+    subgraph C["Giai đoạn 1 — Huấn luyện neural audio codec"]
+        A["Audio FMA<br/>waveform 32 kHz"] --> B["CNN Audio Encoder"]
+        B --> D["Latent<br/>50 frame/giây"]
+        D --> E["Residual Vector Quantizer<br/>8 × 1.024 code"]
+        E --> F["Acoustic tokens"]
+        E --> G["RVQ Embeddings"]
+        G --> H["CNN Audio Decoder"]
+        H --> I["Waveform tái tạo"]
+        I -. "L1 + Multi-resolution STFT loss" .-> A
+    end
 
-Audio huấn luyện
-  → CNN audio encoder
-  → Residual Vector Quantizer (8 × 1.024 code)
-  → acoustic token ở 50 frame/giây
+    subgraph M["Giai đoạn 2 — Huấn luyện Music Transformer"]
+        J["Prompt Việt / Anh"] --> K["UTF-8 ByteTokenizer"]
+        K --> L["Transformer Text Encoder<br/>4 lớp"]
+        L --> N["Cross-attention conditioning"]
+        F --> O["Delay Pattern<br/>8 codebook"]
+        O --> P["Transformer Decoder<br/>6 lớp + CFG"]
+        N --> P
+        P --> Q["Acoustic tokens dự đoán"]
+    end
+
+    Q --> R["RVQ Decode"]
+    R --> S["CNN Audio Decoder đã huấn luyện"]
+    S --> T["Nhạc đầu ra<br/>WAV 32 kHz"]
+
+    classDef audio fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef text fill:#dcfce7,stroke:#16a34a,color:#052e16;
+    classDef model fill:#f3e8ff,stroke:#9333ea,color:#3b0764;
+    classDef token fill:#ffedd5,stroke:#ea580c,color:#431407;
+    class A,I,T audio;
+    class J,K,L,N text;
+    class B,G,H,P,R,S model;
+    class D,E,F,O,Q token;
 ```
 
 Pipeline được huấn luyện theo hai giai đoạn:
